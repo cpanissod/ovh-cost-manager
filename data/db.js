@@ -310,6 +310,9 @@ function getDb() {
         UPDATE accounts SET last_success_at = last_import_at WHERE last_import_status = 'success'
       `);
     });
+    // The cost source of each account's entry in config.json, which the next import records:
+    // NULL until then, read as its bills, the only source before
+    addColumnIfNotExists(db, 'accounts', 'cost_source', 'TEXT');
     // What keeps the lock of a long import (#113)
     addColumnIfNotExists(db, 'import_log', 'heartbeat_at', 'DATETIME');
     // The credit movements keyed by their account too (#114): their ids, which join the name
@@ -734,20 +737,25 @@ const importLogOps = {
 const accountsOps = {
   /**
    * Records an account that an import reads, or updates one it knows: its currency, and the
-   * name and budget of its entry in config.json, which only an import can match with the
-   * account (#113). A rename in config.json thus shows once the account is imported again.
+   * name, budget and cost source of its entry in config.json, which only an import can match
+   * with the account (#113). A rename in config.json thus shows once the account is imported
+   * again.
    * @param {object} account - As GET /me names it
    * @param {string} account.nic - Its NIC handle
    * @param {?string} account.currency - The code of the currency it bills in, such as EUR
    * @param {?string} [account.name] - The name of its entry, null when it has none
    * @param {?number} [account.budget] - The budget of its entry, null when it has none
+   * @param {string} [account.costSource] - The cost source of its entry (CONTEXT.md):
+   *   'bills', by default, or 'cloudUsage'
    */
-  upsert: ({ nic, currency, name = null, budget = null }) => {
+  upsert: ({ nic, currency, name = null, budget = null, costSource = 'bills' }) => {
     const db = getDb();
     return db.prepare(`
-      INSERT INTO accounts (nic, currency, name, budget) VALUES (@nic, @currency, @name, @budget)
-      ON CONFLICT(nic) DO UPDATE SET currency = @currency, name = @name, budget = @budget
-    `).run({ nic, currency, name, budget });
+      INSERT INTO accounts (nic, currency, name, budget, cost_source)
+      VALUES (@nic, @currency, @name, @budget, @costSource)
+      ON CONFLICT(nic) DO UPDATE SET
+        currency = @currency, name = @name, budget = @budget, cost_source = @costSource
+    `).run({ nic, currency, name, budget, costSource });
   },
 
   // Which account the rows belong to, and the rows that an import gives to an account,
@@ -841,11 +849,13 @@ const accountsOps = {
    * @returns {object[]} Every account recorded: those that the configuration of the last run
    *   lists, in its order, then the others by NIC handle. Each gives the accounts table's
    *   nic, currency, last_import_at, last_import_status, last_import_error, last_success_at,
-   *   name and budget, and `configured`, whether that configuration lists it.
+   *   name, budget and cost_source, 'bills' for an account recorded before the cost sources,
+   *   and `configured`, whether that configuration lists it.
    */
   getAll: () => getDb().prepare(`
     SELECT nic, currency, last_import_at, last_import_status, last_import_error,
-      last_success_at, name, budget, position IS NOT NULL AS configured
+      last_success_at, name, budget, COALESCE(cost_source, 'bills') AS cost_source,
+      position IS NOT NULL AS configured
     FROM accounts
     ORDER BY position IS NULL, position, nic
   `).all().map(account => ({ ...account, configured: account.configured === 1 }))

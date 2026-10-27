@@ -1602,13 +1602,15 @@ async function runImport(params) {
       ? [findAccount(attempts, params.account, configuration.source)]
       : attempts;
 
-    // Each account named is recorded, with the name and budget of its entry, and the
-    // failure of one that bills in another currency
+    // Each account named is recorded, with the name, budget and cost source of its entry, and
+    // the failure of one that bills in another currency
     const [only] = accounts;
     const migrated = db.transaction(() => {
       for (const { entry, nic, lastNic, currency, error } of accounts) {
         if (nic) {
-          db.accounts.upsert({ nic, currency, name: entry.name, budget: entry.budget });
+          db.accounts.upsert({
+            nic, currency, name: entry.name, budget: entry.budget, costSource: entry.costSource,
+          });
           if (error) db.accounts.recordImport(nic, { status: 'failed', error: reasonOf(error) });
         } else if (lastNic) {
           // GET /me failed, but the entry's name is the one that an import last recorded an

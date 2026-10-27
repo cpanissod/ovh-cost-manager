@@ -16,8 +16,10 @@ CREATE TABLE IF NOT EXISTS accounts (
                                  -- NULL when that one does not list it any more (#114)
   claimed_bills INTEGER NOT NULL DEFAULT 0, -- How many bills stored before the accounts it
                                  -- claimed, over every run (#114)
-  last_success_at DATETIME       -- When its last import that succeeded ended, NULL until one
+  last_success_at DATETIME,      -- When its last import that succeeded ended, NULL until one
                                  -- has: its data is as fresh as that import left it (#124)
+  cost_source TEXT               -- Where its costs come from at its last import: 'bills' or
+                                 -- 'cloudUsage' (CONTEXT.md), NULL before any, read as 'bills'
 );
 
 -- Cloud Projects
