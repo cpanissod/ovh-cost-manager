@@ -29,7 +29,8 @@ const { classifyService, classifyResourceTypeFromDomain } = require('./classify'
 const { footprintMonths, readFootprintFile } = require('./carbon-footprint');
 const { beyondTotal, readForecast, usageRows } = require('./cloud-usage');
 const { acceptingRequest } = require('./ovh-accepting-request');
-const { monthBounds } = require('./months');
+const { monthBounds, monthOfDate } = require('./months');
+const { usageBillOf, usageLines, usageMonth } = require('./usage-lines');
 const { storageClassLabel } = require('./storage-classes');
 
 // Skip this run if another import (cron or manual resync) is in progress.
@@ -1301,6 +1302,81 @@ async function importBill(ovh, billId, { nic, params, projectMap, resourceTypeMa
   return details.length;
 }
 
+// --- The Public Cloud usage, for an account whose cost source it is ---
+
+/**
+ * Imports the Public Cloud usage of the account, for an account whose cost source it is
+ * (CONTEXT.md): its bills, which a third party issues, are given neither by the API nor by the
+ * control panel. Each project's usage periods, which usage/history lists for the month of today
+ * and the six months before, are stored on the usage bill of the account's month
+ * (data/usage-lines.js): a period that OVH updated since the last import is fetched again, its
+ * lines replacing the stored ones, and the others are not, but at a full import. A period that
+ * OVH no longer lists stays, as no call gives it again. The usage bill of the month of today is
+ * provisional. A project whose usage cannot be imported keeps what was stored, counts among the
+ * failed items, and the others are imported all the same.
+ * @param {object} ovh - The OVH API client of the account
+ * @param {string} nic - The NIC handle of the account
+ * @param {string[]} projectIds - Its Public Cloud projects, which its API lists
+ * @param {object} run
+ * @param {boolean} run.full - Whether to fetch every period again
+ * @param {Object<string, string>} run.resourceTypeMap - The type of each service of its
+ *   inventories by id, as the bill lines take it
+ * @param {function()} run.heartbeat - Keeps the run's lock
+ * @returns {Promise<{periods: number, lines: number}>} How many periods it stored, and lines
+ */
+async function importCloudUsage(ovh, nic, projectIds, { full, resourceTypeMap, heartbeat }) {
+  console.log('\n--- Importing the Public Cloud usage ---');
+  const imported = { periods: 0, lines: 0 };
+  for (const projectId of projectIds) {
+    heartbeat();
+    console.log(`  Project ${projectId}...`);
+    try {
+      const history = await withRetry(() => ovh.requestPromised('GET',
+        `/cloud/project/${projectId}/usage/history`));
+      const stored = db.usage.getPeriods(projectId);
+      for (const listed of history || []) {
+        // A period's id, or the period with its id, its dates and its last update
+        const period = typeof listed === 'string' ? { id: listed } : listed;
+        if (!full && period.lastUpdate && stored.get(period.id) === period.lastUpdate) continue;
+        const usage = await withRetry(() => ovh.requestPromised('GET',
+          `/cloud/project/${projectId}/usage/history/${period.id}`));
+        const month = usageMonth(usage) ?? usageMonth(period);
+        if (!month) throw new Error(`its usage ${period.id} gives no period`);
+        const lines = usageLines(usage).map((line) => ({
+          ...line,
+          // Each line of a project names it, as those of its bills do
+          project_id: projectId,
+          domain: projectId,
+          service_type: classifyService(line.description),
+          resource_type: resourceTypeMap[projectId]
+            || classifyResourceTypeFromDomain(projectId, line.description),
+        }));
+        db.usage.replacePeriod({
+          bill: {
+            ...usageBillOf(nic, month),
+            currency: usage.totalPrice?.currencyCode || 'EUR',
+            account: nic,
+          },
+          projectId,
+          usageId: period.id,
+          month,
+          lastUpdate: usage.lastUpdate ?? period.lastUpdate ?? null,
+          lines,
+        });
+        imported.periods += 1;
+        imported.lines += lines.length;
+        console.log(`    ${month}: ${lines.length} lines`);
+      }
+    } catch (err) {
+      failedItemCount += 1;
+      console.error(`    Error importing the usage of project ${projectId}: ${describeError(err)}`);
+    }
+  }
+  // The month of today's usage, as the server's local date gives it
+  db.usage.markProvisional(nic, usageBillOf(nic, monthOfDate(new Date())).date);
+  return imported;
+}
+
 // --- The carbon footprint (#147) ---
 
 // How the import waits for the carbon calculator: it asks how its task goes every 3 seconds,
@@ -1378,26 +1454,33 @@ async function importCarbonFootprint(ovh, nic, heartbeat) {
 
 /**
  * Imports one account through its OVH API client: its projects, its inventories when asked,
- * its bills from the day that billsStartOf() gives, then the other datasets asked for. Every
- * row it writes carries the account's NIC handle, or reaches it through its bill or project.
+ * its bills from the day that billsStartOf() gives, or else, when its cost source is its Public
+ * Cloud usage (CONTEXT.md), that usage, then the other datasets asked for. Every row it writes
+ * carries the account's NIC handle, or reaches it through its bill or project.
  * @param {object} ovh - The OVH API client of the account
  * @param {string} nic - The NIC handle of the account
  * @param {object} run - `params`, the options of the run, `importType`, as its log entry
- *   names it, `toDate`, the day it imports the bills to, and `heartbeat()`, which keeps the
- *   run's lock
+ *   names it, `toDate`, the day it imports the bills to, `heartbeat()`, which keeps the run's
+ *   lock, and `costSource`, the account's: 'bills', by default, or 'cloudUsage'
  * @returns {Promise<{imported: {projects: number, bills: number, details: number},
  *   error: (*|undefined)}>} What it wrote, counted as it wrote it, even when it failed
- *   partway, as its rows stay; and what failed it, when the list of its projects or of its
- *   bills could not be fetched
+ *   partway, as its rows stay: the usage periods count as bills; and what failed it, when the
+ *   list of its projects or of its bills could not be fetched
  */
-async function importAccount(ovh, nic, { params, importType, toDate, heartbeat }) {
+async function importAccount(ovh, nic, {
+  params, importType, toDate, heartbeat, costSource = 'bills',
+}) {
   const imported = { projects: 0, bills: 0, details: 0 };
+  // Its bills, which a third party issues, are not to be fetched
+  const fromUsage = costSource === 'cloudUsage';
   try {
     // Unless the database had one account alone, the rows stored before the accounts are
     // each account's whose API lists them (#114): its bills first, before its latest bill
     // tells where its import starts. The writers of its projects and services claim those it
     // lists.
-    if (db.accounts.hasRowsWithoutAccount('bills')) await claimBillsOfBefore(ovh, nic);
+    if (!fromUsage && db.accounts.hasRowsWithoutAccount('bills')) {
+      await claimBillsOfBefore(ovh, nic);
+    }
     // Once one account alone claimed the bills stored before, the database was its own, and
     // it gets the rest: before the datasets, so that its own history replaces the months
     // stored then, rather than adding them twice
@@ -1425,26 +1508,35 @@ async function importAccount(ovh, nic, { params, importType, toDate, heartbeat }
     // cron and the resync import, takes many calls for each
     heartbeat();
 
-    const billIds = await fetchBills(ovh, billsStartOf(nic, params), toDate);
-    console.log('\nProcessing bills...');
-    for (const [index, billId] of billIds.entries()) {
-      // Each bill keeps the run's lock: a whole history takes long
-      heartbeat();
-      process.stdout.write(`  [${index + 1}/${billIds.length}] ${billId}...`);
-      // A differential import only adds the bills it lacks, which keeps the daily run short
-      if (importType === 'differential' && db.bills.exists(billId)) {
-        console.log(' skipped (exists)');
-        continue;
-      }
-      try {
-        const lines = await importBill(ovh, billId, { nic, params, projectMap, resourceTypeMap });
-        imported.bills += 1;
-        imported.details += lines;
-        console.log(` ${lines} details`);
-      } catch (err) {
-        // The bill is skipped, as a failed item is, and counted in the summary
-        failedItemCount += 1;
-        console.log(` ERROR: ${describeError(err)}`);
+    if (fromUsage) {
+      // The whole window that OVH gives, whatever the dates of the run
+      const usage = await importCloudUsage(ovh, nic, Object.keys(projectMap),
+        { full: Boolean(params.full), resourceTypeMap, heartbeat });
+      imported.bills += usage.periods;
+      imported.details += usage.lines;
+    } else {
+      const billIds = await fetchBills(ovh, billsStartOf(nic, params), toDate);
+      console.log('\nProcessing bills...');
+      for (const [index, billId] of billIds.entries()) {
+        // Each bill keeps the run's lock: a whole history takes long
+        heartbeat();
+        process.stdout.write(`  [${index + 1}/${billIds.length}] ${billId}...`);
+        // A differential import only adds the bills it lacks, which keeps the daily run short
+        if (importType === 'differential' && db.bills.exists(billId)) {
+          console.log(' skipped (exists)');
+          continue;
+        }
+        try {
+          const lines = await importBill(ovh, billId,
+            { nic, params, projectMap, resourceTypeMap });
+          imported.bills += 1;
+          imported.details += lines;
+          console.log(` ${lines} details`);
+        } catch (err) {
+          // The bill is skipped, as a failed item is, and counted in the summary
+          failedItemCount += 1;
+          console.log(` ERROR: ${describeError(err)}`);
+        }
       }
     }
 
@@ -1655,7 +1747,11 @@ async function runImport(params) {
     const unimportable = accounts.filter(({ error }) => error);
     if (params.full && importable.length > 0) {
       db.transaction(() => {
-        for (const { nic } of importable) db.clearAccount(nic);
+        // The usage bills of an account whose cost source is its Public Cloud usage stay: OVH
+        // gives the last months' usage alone
+        for (const { nic, entry } of importable) {
+          db.clearAccount(nic, { keepUsageBills: entry.costSource === 'cloudUsage' });
+        }
         if (!params.account) db.importLog.clearAllBut(importId);
       });
     }
@@ -1671,7 +1767,7 @@ async function runImport(params) {
     for (const account of importable) {
       if (several) console.log(`\n=== ACCOUNT ${describeAccount(account)} ===`);
       const { imported, error } = await importAccount(account.client, account.nic,
-        { params, importType, toDate, heartbeat });
+        { params, importType, toDate, heartbeat, costSource: account.entry.costSource });
       // What it wrote counts, even when it failed partway: its rows stay
       for (const figure of Object.keys(stats)) stats[figure] += imported[figure];
       if (error) {
