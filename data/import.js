@@ -1108,8 +1108,7 @@ async function importCloudDetails(ovh, projectIds, nic, heartbeat = () => {}) {
         const { start: periodStart, end: periodEnd } = usagePeriod(usage);
         if (!consumptionMonth || periodStart > consumptionMonth) consumptionMonth = periodStart;
 
-        // Clear old data for this project: its consumption of the other months is kept
-        db.cloudDetails.clearProjectInventory(projectId);
+        // Its consumption of the month replaced: that of the other months is kept
         db.cloudDetails.clearConsumptionOfMonth(projectId, periodStart);
 
         // Every part of the usage, one row per resource and cloud resource kind, which add
@@ -1137,51 +1136,62 @@ async function importCloudDetails(ovh, projectIds, nic, heartbeat = () => {}) {
     // Its month-end forecast
     await importForecast(ovh, projectId);
 
-    // Instances
+    // Instances, retried as OVH may fail a call, and replaced only once fetched: a failed call
+    // keeps the stored instances, as it keeps the volumes
     try {
-      const instances = await ovh.requestPromised('GET', `/cloud/project/${projectId}/instance`);
-      for (const inst of (instances || [])) {
-        // OVH API returns flavor as object with id/name, plus planCode at root
-        const flavorName = inst.flavor?.name || inst.flavorId || '';
-        // planCode is the reliable identifier (e.g. "l4-90.consumption", "b2-7.monthly.postpaid")
-        // Strip billing suffixes to get clean flavor name
-        const planCode = (inst.planCode || '').replace(/\.(consumption|monthly\.postpaid)$/, '');
-        db.cloudDetails.upsertInstance({
-          id: inst.id,
-          project_id: projectId,
-          name: inst.name || '',
-          flavor: flavorName,
-          plan_code: planCode,
-          region: inst.region || '',
-          status: inst.status || '',
-          created_at: inst.created || null,
-          monthly_billing: inst.monthlyBilling ? 1 : 0
-        });
-      }
+      const instances = await withRetry(() => ovh.requestPromised('GET',
+        `/cloud/project/${projectId}/instance`));
+      db.transaction(() => {
+        db.cloudDetails.clearInstancesByProject(projectId);
+        for (const inst of (instances || [])) {
+          // OVH API returns flavor as object with id/name, plus planCode at root
+          const flavorName = inst.flavor?.name || inst.flavorId || '';
+          // planCode is the reliable identifier (e.g. "l4-90.consumption",
+          // "b2-7.monthly.postpaid"). Strip billing suffixes to get clean flavor name
+          const planCode = (inst.planCode || '').replace(/\.(consumption|monthly\.postpaid)$/, '');
+          db.cloudDetails.upsertInstance({
+            id: inst.id,
+            project_id: projectId,
+            name: inst.name || '',
+            flavor: flavorName,
+            plan_code: planCode,
+            region: inst.region || '',
+            status: inst.status || '',
+            created_at: inst.created || null,
+            monthly_billing: inst.monthlyBilling ? 1 : 0
+          });
+        }
+      });
       console.log(`    ${(instances || []).length} instances`);
     } catch (err) {
-      console.error(`    Error fetching instances: ${err.message}`);
+      console.warn(`    Instance fetch of project ${projectId} failed, keeping the stored `
+        + `instances: ${describeError(err)}`);
     }
 
-    // Quotas
+    // Quotas, as the instances
     try {
-      const quotas = await ovh.requestPromised('GET', `/cloud/project/${projectId}/quota`);
-      for (const q of (quotas || [])) {
-        const inst = q.instance || {};
-        db.cloudDetails.insertQuota({
-          project_id: projectId,
-          region: q.region || '',
-          max_cores: inst.maxCores || 0,
-          max_instances: inst.maxInstances || 0,
-          max_ram_mb: inst.maxRam || 0,
-          used_cores: inst.usedCores || 0,
-          used_instances: inst.usedInstances || 0,
-          used_ram_mb: inst.usedRAM || 0
-        });
-      }
+      const quotas = await withRetry(() => ovh.requestPromised('GET',
+        `/cloud/project/${projectId}/quota`));
+      db.transaction(() => {
+        db.cloudDetails.clearQuotasByProject(projectId);
+        for (const q of (quotas || [])) {
+          const inst = q.instance || {};
+          db.cloudDetails.insertQuota({
+            project_id: projectId,
+            region: q.region || '',
+            max_cores: inst.maxCores || 0,
+            max_instances: inst.maxInstances || 0,
+            max_ram_mb: inst.maxRam || 0,
+            used_cores: inst.usedCores || 0,
+            used_instances: inst.usedInstances || 0,
+            used_ram_mb: inst.usedRAM || 0
+          });
+        }
+      });
       console.log(`    ${(quotas || []).length} quota regions`);
     } catch (err) {
-      console.error(`    Error fetching quotas: ${err.message}`);
+      console.warn(`    Quota fetch of project ${projectId} failed, keeping the stored quotas: `
+        + `${describeError(err)}`);
     }
 
     // Block storage volumes

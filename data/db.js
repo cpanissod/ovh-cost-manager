@@ -2636,11 +2636,14 @@ const cloudDetailOps = {
     db.prepare('DELETE FROM object_storage_buckets WHERE project_id = ?').run(projectId);
   },
 
-  // A project's instances and quotas: inventories, which each import replaces
-  clearProjectInventory: (projectId) => {
-    const db = getDb();
-    db.prepare('DELETE FROM cloud_instances WHERE project_id = ?').run(projectId);
-    db.prepare('DELETE FROM project_quotas WHERE project_id = ?').run(projectId);
+  // A project's instances, an inventory that each import replaces once it fetched it
+  clearInstancesByProject: (projectId) => {
+    getDb().prepare('DELETE FROM cloud_instances WHERE project_id = ?').run(projectId);
+  },
+
+  // A project's quotas, an inventory that each import replaces once it fetched it
+  clearQuotasByProject: (projectId) => {
+    getDb().prepare('DELETE FROM project_quotas WHERE project_id = ?').run(projectId);
   },
 
   // A project's consumption of the month that starts on `periodStart` (YYYY-MM-01). The
